@@ -11,7 +11,7 @@ import (
 func Start() {
 	app := fiber.New()
 
-	// Logging chi tiết
+	// Logging chi tiết, dùng logger mặc định
 	app.Use(logger.New(logger.Config{
 		Format: "${time} | ${ip} | ${method} ${path} | ${status} | ${latency} | ${ua} | ${error}\n",
 	}))
@@ -21,8 +21,11 @@ func Start() {
 		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
 	}))
 
-	// Middleware xác thực JWT cho /api/*
+	// Middleware xác thực JWT cho /api/*, bỏ qua nếu là WebSocket upgrade
 	app.Use("/api/*", func(c *fiber.Ctx) error {
+		if c.Get("Upgrade") == "websocket" {
+			return c.Next()
+		}
 		token := c.Get("Authorization")
 		if len(token) > 7 && token[:7] == "Bearer " {
 			token = token[7:]
@@ -56,6 +59,6 @@ func Start() {
 		return c.SendStatus(501)
 	})
 
-	log.Info().Msg("API Gateway started on :8080")
-	app.Listen(":8080")
+	log.Info().Msg("API Gateway started on :8083")
+	app.Listen(":8083")
 }
