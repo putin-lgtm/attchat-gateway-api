@@ -1,19 +1,4 @@
-openapi: 3.0.0
 info:
-  title: attchat-gateway-api
-  version: 1.0.0
-  description: API Gateway for ATTChat
-paths:
-  /health:
-    get:
-      summary: Health check
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  status:
-                    type: string
+  contact: {}
+paths: {}
+swagger: "2.0"
