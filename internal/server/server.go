@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,10 +20,30 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/golang-jwt/jwt/v5"
+	cpuutil "github.com/shirou/gopsutil/v3/cpu"
+	memutil "github.com/shirou/gopsutil/v3/mem"
+	netutil "github.com/shirou/gopsutil/v3/net"
 	"github.com/valyala/fasthttp"
 )
 
 var totalAPICalls int64
+
+type netSample struct {
+	bytes uint64
+	time  time.Time
+}
+
+var (
+	netMu         sync.Mutex
+	lastNetSample netSample
+)
+
+type systemInfo struct {
+	CPUPercent string `json:"cpu_used_percent"`
+	RAMPercent string `json:"ram_used_percent"`
+	RAMUsedMB  string `json:"ram_used_mb"`
+	NetMbps    string `json:"net_mbps"`
+}
 
 func Start() {
 	app := fiber.New()
@@ -99,17 +120,15 @@ func Start() {
 
 	// Root health/info
 	app.Get("/", func(c *fiber.Ctx) error {
-		mbps := measureNetworkMbps()
-		mbpsRounded := round2(mbps)
+		sys := systemMetrics()
 		return c.JSON(fiber.Map{
-			"status":                "healthy",
-			"message":               "ATTChat Gateway API is running",
-			"version":               "2.0",
-			"proxy_to":              chatBase,
-			"arch":                  "gateway-api",
-			"total_api_connected": 	 atomic.LoadInt64(&totalAPICalls),
-			"network_mbps":          mbpsRounded,
-			"network_status":        networkStatus(mbpsRounded),
+			"status":              "healthy",
+			"message":             "ATTChat Gateway API is running",
+			"version":             "2.0",
+			"proxy_to":            chatBase,
+			"arch":                "gateway-api",
+			"total_api_connected": atomic.LoadInt64(&totalAPICalls),
+			"system":              sys,
 		})
 	})
 
@@ -281,4 +300,82 @@ func networkStatus(mbps float64) string {
 	default:
 		return "slow"
 	}
+}
+
+// system metrics (gopsutil)
+func systemMetrics() systemInfo {
+	cpuP := cpuPercent()
+	memP, memUsed := memStats()
+	netMbps := netThroughputMbps()
+	return systemInfo{
+		CPUPercent: fmtPercent(cpuP),
+		RAMPercent: fmtPercent(memP),
+		RAMUsedMB:  fmtMB(memUsed),
+		NetMbps:    fmtMbps(netMbps),
+	}
+}
+
+func cpuPercent() float64 {
+	perc, err := cpuutil.Percent(0, false)
+	if err != nil || len(perc) == 0 {
+		return -1
+	}
+	return perc[0]
+}
+
+func memStats() (percent float64, usedMB float64) {
+	vm, err := memutil.VirtualMemory()
+	if err != nil {
+		return -1, -1
+	}
+	return vm.UsedPercent, float64(vm.Used) / (1024 * 1024)
+}
+
+func netThroughputMbps() float64 {
+	counters, err := netutil.IOCounters(true)
+	if err != nil || len(counters) == 0 {
+		return -1
+	}
+	var total uint64
+	for _, c := range counters {
+		total += c.BytesRecv + c.BytesSent
+	}
+	now := time.Now()
+
+	netMu.Lock()
+	defer netMu.Unlock()
+
+	if lastNetSample.time.IsZero() {
+		lastNetSample = netSample{bytes: total, time: now}
+		return 0
+	}
+	deltaBytes := total - lastNetSample.bytes
+	elapsed := now.Sub(lastNetSample.time).Seconds()
+	lastNetSample = netSample{bytes: total, time: now}
+	if elapsed <= 0 {
+		return 0
+	}
+	return (float64(deltaBytes) * 8) / (elapsed * 1_000_000)
+}
+
+// format helpers
+func fmtPercent(v float64) string {
+	if v < 0 {
+		return "N/A"
+	}
+	return fmt.Sprintf("%.2f%%", v)
+}
+
+func fmtMB(v float64) string {
+	if v < 0 {
+		return "N/A"
+	}
+	return fmt.Sprintf("%.2f MB", v)
+}
+
+func fmtMbps(v float64) string {
+	if v < 0 {
+		return "N/A"
+	}
+	return fmt.Sprintf("%.2f Mbps", v)
 }
