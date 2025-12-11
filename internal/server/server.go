@@ -244,7 +244,12 @@ func forwardToChat(chatBase string) fiber.Handler {
 		req.SetRequestURI(targetURL)
 
 		if err := fasthttp.Do(&req, &res); err != nil {
+			log.Printf("[ERROR] proxy %s -> %s failed: %v", c.OriginalURL(), targetURL, err)
 			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": err.Error()})
+		}
+
+		if res.StatusCode() >= 400 {
+			log.Printf("[WARN] upstream %s responded %d for %s", targetURL, res.StatusCode(), c.OriginalURL())
 		}
 
 		// Propagate status, headers, body
