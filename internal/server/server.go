@@ -1,13 +1,19 @@
 package server
 
 import (
+	"bytes"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
+	"math"
+	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
@@ -15,6 +21,8 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/valyala/fasthttp"
 )
+
+var totalAPICalls int64
 
 func Start() {
 	app := fiber.New()
@@ -91,12 +99,17 @@ func Start() {
 
 	// Root health/info
 	app.Get("/", func(c *fiber.Ctx) error {
+		mbps := measureNetworkMbps()
+		mbpsRounded := round2(mbps)
 		return c.JSON(fiber.Map{
-			"status":   "healthy",
-			"message":  "ATTChat Gateway API is running",
-			"version":  "2.0",
-			"proxy_to": chatBase,
-			"arch":     "gateway-api",
+			"status":                "healthy",
+			"message":               "ATTChat Gateway API is running",
+			"version":               "2.0",
+			"proxy_to":              chatBase,
+			"arch":                  "gateway-api",
+			"total_api_connected": 	 atomic.LoadInt64(&totalAPICalls),
+			"network_mbps":          mbpsRounded,
+			"network_status":        networkStatus(mbpsRounded),
 		})
 	})
 
@@ -195,6 +208,9 @@ func loadAllowedIssuers() []string {
 
 func forwardToChat(chatBase string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		// Count every proxied API request
+		atomic.AddInt64(&totalAPICalls, 1)
+
 		// Build target URL
 		targetPath := strings.TrimPrefix(c.OriginalURL(), "/api")
 		if !strings.HasPrefix(targetPath, "/") {
@@ -218,5 +234,51 @@ func forwardToChat(chatBase string) fiber.Handler {
 			c.Response().Header.SetBytesKV(k, v)
 		})
 		return c.Send(res.Body())
+	}
+}
+
+// measureNetworkMbps performs a small download against a configurable URL to estimate throughput.
+// Default URL downloads 100KB from Cloudflare speed endpoint. Returns -1 on error/timeout.
+func measureNetworkMbps() float64 {
+	testURL := getenvDefault("GATEWAY_NET_SPEED_URL", "https://speed.cloudflare.com/__down?bytes=100000")
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	start := time.Now()
+	resp, err := client.Get(testURL)
+	if err != nil {
+		return -1
+	}
+	defer resp.Body.Close()
+
+	var buf bytes.Buffer
+	n, err := io.Copy(&buf, resp.Body)
+	if err != nil {
+		return -1
+	}
+	secs := time.Since(start).Seconds()
+	if secs == 0 {
+		return -1
+	}
+	mbps := (float64(n) * 8) / (secs * 1_000_000) // bytes -> bits -> megabits
+	return mbps
+}
+
+// round2 rounds to 2 decimal places
+func round2(v float64) float64 {
+	return math.Round(v*100) / 100
+}
+
+// networkStatus labels network speed qualitatively
+func networkStatus(mbps float64) string {
+	if mbps < 0 {
+		return "unreachable"
+	}
+	switch {
+	case mbps >= 20:
+		return "fast"
+	case mbps >= 5:
+		return "medium"
+	default:
+		return "slow"
 	}
 }
