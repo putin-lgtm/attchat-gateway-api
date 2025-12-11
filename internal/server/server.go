@@ -89,6 +89,17 @@ func Start() {
 		return c.Next()
 	})
 
+	// Root health/info
+	app.Get("/", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"status":   "healthy",
+			"message":  "ATTChat Gateway API is running",
+			"version":  "2.0",
+			"proxy_to": chatBase,
+			"arch":     "gateway-api",
+		})
+	})
+
 	// Health check
 	app.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok"})
