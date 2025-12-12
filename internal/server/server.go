@@ -2,14 +2,17 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -20,10 +23,13 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	cpuutil "github.com/shirou/gopsutil/v3/cpu"
 	memutil "github.com/shirou/gopsutil/v3/mem"
 	netutil "github.com/shirou/gopsutil/v3/net"
 	"github.com/valyala/fasthttp"
+	"nhooyr.io/websocket"
 )
 
 var totalAPICalls int64
@@ -38,11 +44,46 @@ var (
 	lastNetSample netSample
 )
 
+var (
+	jsClient     jetstream.JetStream
+	jsStreams    []string
+	natsConn     *nats.Conn
+	streamsMu    sync.Mutex
+	jsReadyError error
+	wsBaseURL    string
+)
+
 type systemInfo struct {
 	CPUPercent string `json:"cpu_used_percent"`
 	RAMPercent string `json:"ram_used_percent"`
 	RAMUsedMB  string `json:"ram_used_mb"`
 	NetMbps    string `json:"net_mbps"`
+}
+
+type publishRequest struct {
+	Event     string          `json:"event"`             // logical event name, e.g. user_join_chat
+	Type      string          `json:"type"`              // stream key, e.g. CHAT/NOTIFY
+	RoomID    string          `json:"room_id,omitempty"` // room to broadcast
+	UserID    string          `json:"user_id,omitempty"` // optional routing
+	BrandID   string          `json:"brand_id,omitempty"`
+	ChatID    string          `json:"chat_id,omitempty"`
+	Message   string          `json:"message,omitempty"`   // optional message content
+	Payload   json.RawMessage `json:"payload,omitempty"`   // full payload if caller already structured
+	Timestamp string          `json:"timestamp,omitempty"` // ISO string, defaults now
+	Subject   string          `json:"subject,omitempty"`   // optional override
+	Stream    string          `json:"stream,omitempty"`    // optional override stream name
+	Token     string          `json:"token,omitempty"`     // JWT for WS connect
+}
+
+type natsEvent struct {
+	Type          string          `json:"type"`
+	Room          string          `json:"room,omitempty"`
+	UserID        string          `json:"user_id,omitempty"`
+	BrandID       string          `json:"brand_id,omitempty"`
+	ChatID        string          `json:"chat_id,omitempty"`
+	Payload       json.RawMessage `json:"payload,omitempty"`
+	Timestamp     time.Time       `json:"timestamp"`
+	ExcludeConnID string          `json:"exclude_conn_id,omitempty"`
 }
 
 func Start() {
@@ -62,6 +103,7 @@ func Start() {
 	// Default chat base includes /api/v1 so client can call /api/... on gateway
 	chatBase := getenvDefault("CHAT_SERVICE_BASE", "http://localhost:8080/api/v1")
 	chatBase = strings.TrimRight(chatBase, "/")
+	wsBaseURL = getenvDefault("GATEWAY_WS_BASE", "ws://localhost:8086/ws")
 	allowedIssuers := loadAllowedIssuers()
 	pubKeyPEM := loadPublicKey()
 	if strings.TrimSpace(pubKeyPEM) == "" {
@@ -71,6 +113,12 @@ func Start() {
 	pubKey, err := parseRSAPublicKey(pubKeyPEM)
 	if err != nil {
 		log.Fatalf("failed to parse JWT public key: %v", err)
+	}
+
+	// Init NATS / JetStream for publish endpoint
+	jsReadyError = initJetStream()
+	if jsReadyError != nil {
+		log.Printf("WARN: JetStream init failed, /api/publish-chat-event will return 503: %v", jsReadyError)
 	}
 
 	// Auth middleware cho /api/*
@@ -118,6 +166,9 @@ func Start() {
 		return c.Next()
 	})
 
+	// Special publish endpoint (không proxy)
+	app.Post("/api/publish-chat-event", handlePublishEvent)
+
 	// Root health/info
 	app.Get("/", func(c *fiber.Ctx) error {
 		sys := systemMetrics()
@@ -134,7 +185,14 @@ func Start() {
 
 	// Health check
 	app.Get("/health", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"status": "ok"})
+		return c.JSON(fiber.Map{
+			"status": "ok",
+			"jetstream": fiber.Map{
+				"streams":   jsStreams,
+				"connected": jsReadyError == nil,
+				"error":     errorString(jsReadyError),
+			},
+		})
 	})
 
 	// Proxy /api/* xuống chat-service
@@ -259,6 +317,211 @@ func forwardToChat(chatBase string) fiber.Handler {
 		})
 		return c.Send(res.Body())
 	}
+}
+
+// handlePublishEvent publishes chat metadata into JetStream
+func handlePublishEvent(c *fiber.Ctx) error {
+	if jsClient == nil || jsReadyError != nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "jetstream_unavailable", "detail": errorString(jsReadyError)})
+	}
+
+	var req publishRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_body", "detail": err.Error()})
+	}
+
+	streamName := strings.TrimSpace(req.Stream)
+	if streamName == "" {
+		streamName = strings.TrimSpace(req.Type)
+	}
+	if streamName == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing_type", "detail": "type/stream is required to pick JetStream stream"})
+	}
+	streamName = strings.ToUpper(streamName)
+
+	// Pick token for WS connect: prefer body, fallback Authorization header
+	token := strings.TrimSpace(req.Token)
+	if token == "" {
+		authz := c.Get("Authorization")
+		token = strings.TrimSpace(strings.TrimPrefix(authz, "Bearer "))
+	}
+	if token == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing_token", "detail": "token is required for WS connect"})
+	}
+
+	eventName := strings.TrimSpace(req.Event)
+	if eventName == "" {
+		eventName = streamName
+	}
+
+	subject := strings.TrimSpace(req.Subject)
+	if subject == "" {
+		subject = fmt.Sprintf("%s.events", streamName)
+	}
+
+	ts := time.Now().UTC()
+	if req.Timestamp != "" {
+		if parsed, err := time.Parse(time.RFC3339, req.Timestamp); err == nil {
+			ts = parsed
+		}
+	}
+
+	payload := req.Payload
+	if len(payload) == 0 {
+		if req.Message != "" {
+			payload = json.RawMessage(fmt.Sprintf(`{"message":%q}`, req.Message))
+		} else {
+			payload = json.RawMessage(`{}`)
+		}
+	}
+
+	event := natsEvent{
+		Type:      eventName,
+		Room:      req.RoomID,
+		UserID:    req.UserID,
+		BrandID:   req.BrandID,
+		ChatID:    req.ChatID,
+		Payload:   payload,
+		Timestamp: ts,
+	}
+
+	// Step 1: establish WS to gateway-websocket with given params
+	if wsBaseURL == "" {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "ws_base_missing", "detail": "GATEWAY_WS_BASE is not configured"})
+	}
+
+	wsURL, err := buildWSURL(wsBaseURL, map[string]string{
+		"token":    token,
+		"brand_id": req.BrandID,
+		"type":     streamName,
+		"user_id":  req.UserID,
+		"room_id":  req.RoomID,
+	})
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_ws_url", "detail": err.Error()})
+	}
+
+	wsCtx, wsCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer wsCancel()
+
+	conn, resp, err := websocket.Dial(wsCtx, wsURL, nil)
+	if err != nil {
+		status := fiber.StatusBadGateway
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		return c.Status(status).JSON(fiber.Map{"error": "ws_connect_failed", "detail": err.Error(), "status_code": status})
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "done")
+
+	if err := ensureStream(streamName); err != nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "stream_init_failed", "detail": err.Error()})
+	}
+
+	data, err := json.Marshal(event)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "marshal_failed", "detail": err.Error()})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	ack, err := jsClient.Publish(ctx, subject, data)
+	if err != nil {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "publish_failed", "detail": err.Error()})
+	}
+
+	return c.JSON(fiber.Map{
+		"status":   "ok",
+		"stream":   ack.Stream,
+		"subject":  subject,
+		"seq":      ack.Sequence,
+		"ts":       ts,
+		"event":    eventName,
+		"room_id":  req.RoomID,
+		"user_id":  req.UserID,
+		"brand_id": req.BrandID,
+	})
+}
+
+func initJetStream() error {
+	natsURL := getenvDefault("GATEWAY_NATS_URL", "nats://localhost:4222")
+	streamsRaw := getenvDefault("GATEWAY_NATS_STREAMS", "CHAT")
+	jsStreams = parseStreams(streamsRaw)
+
+	nc, err := nats.Connect(natsURL, nats.Name("attchat-gateway-api"))
+	if err != nil {
+		return err
+	}
+	natsConn = nc
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		nc.Close()
+		return err
+	}
+	jsClient = js
+
+	for _, stream := range jsStreams {
+		if err := ensureStream(stream); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureStream(streamName string) error {
+	if jsClient == nil {
+		return fmt.Errorf("jetstream not initialized")
+	}
+
+	streamsMu.Lock()
+	defer streamsMu.Unlock()
+
+	if info, _ := jsClient.Stream(context.Background(), streamName); info != nil {
+		return nil
+	}
+
+	_, err := jsClient.CreateStream(context.Background(), jetstream.StreamConfig{
+		Name:      streamName,
+		Subjects:  []string{streamName + ".>"},
+		Storage:   jetstream.FileStorage,
+		Retention: jetstream.LimitsPolicy,
+	})
+	return err
+}
+
+func parseStreams(raw string) []string {
+	parts := strings.Split(raw, ",")
+	var out []string
+	for _, p := range parts {
+		if s := strings.TrimSpace(p); s != "" {
+			out = append(out, strings.ToUpper(s))
+		}
+	}
+	return out
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func buildWSURL(base string, params map[string]string) (string, error) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	q := u.Query()
+	for k, v := range params {
+		if strings.TrimSpace(v) != "" {
+			q.Set(k, v)
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
 }
 
 // measureNetworkMbps performs a small download against a configurable URL to estimate throughput.
