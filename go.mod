@@ -4,11 +4,12 @@ go 1.23
 
 require (
 	github.com/gofiber/fiber/v2 v2.52.10
+	github.com/gofiber/swagger v1.1.1
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/nats-io/nats.go v1.35.0
 	github.com/rs/zerolog v1.34.0
 	github.com/shirou/gopsutil/v3 v3.24.5
-	github.com/swaggo/swag v1.16.3
+	github.com/swaggo/swag v1.16.4
 	github.com/valyala/fasthttp v1.51.0
 	nhooyr.io/websocket v1.8.7
 )
@@ -38,6 +39,7 @@ require (
 	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect
 	github.com/rivo/uniseg v0.2.0 // indirect
 	github.com/shoenig/go-m1cpu v0.1.6 // indirect
+	github.com/swaggo/files/v2 v2.0.2 // indirect
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
 	github.com/tklauser/numcpus v0.6.1 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect

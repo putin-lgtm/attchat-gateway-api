@@ -1,4 +1,92 @@
+definitions:
+  server.publishRequest:
+    properties:
+      brand_id:
+        type: string
+      chat_id:
+        type: string
+      event:
+        description: logical event name, e.g. user_join_chat
+        type: string
+      message:
+        description: optional message content
+        type: string
+      payload:
+        description: full payload if caller already structured
+        type: object
+      room_id:
+        description: room to broadcast
+        type: string
+      stream:
+        description: optional override stream name
+        type: string
+      subject:
+        description: optional override
+        type: string
+      timestamp:
+        description: ISO string, defaults now
+        type: string
+      token:
+        description: JWT for WS connect
+        type: string
+      type:
+        description: stream key, e.g. CHAT/NOTIFY
+        type: string
+      user_id:
+        description: optional routing
+        type: string
+    type: object
 info:
   contact: {}
-paths: {}
+paths:
+  /api/publish-chat-event:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Event payload
+        in: body
+        name: payload
+        required: true
+        schema:
+          $ref: '#/definitions/server.publishRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties: true
+            type: object
+        "503":
+          description: Service Unavailable
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Publish chat event to JetStream
+      tags:
+      - chat
+  /health:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Health check
+      tags:
+      - health
 swagger: "2.0"

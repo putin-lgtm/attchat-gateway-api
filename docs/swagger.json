@@ -3,5 +3,134 @@
     "info": {
         "contact": {}
     },
-    "paths": {}
+    "paths": {
+        "/api/publish-chat-event": {
+            "post": {
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "chat"
+                ],
+                "summary": "Publish chat event to JetStream",
+                "parameters": [
+                    {
+                        "description": "Event payload",
+                        "name": "payload",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/server.publishRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/health": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "health"
+                ],
+                "summary": "Health check",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "server.publishRequest": {
+            "type": "object",
+            "properties": {
+                "brand_id": {
+                    "type": "string"
+                },
+                "chat_id": {
+                    "type": "string"
+                },
+                "event": {
+                    "description": "logical event name, e.g. user_join_chat",
+                    "type": "string"
+                },
+                "message": {
+                    "description": "optional message content",
+                    "type": "string"
+                },
+                "payload": {
+                    "description": "full payload if caller already structured",
+                    "type": "object"
+                },
+                "room_id": {
+                    "description": "room to broadcast",
+                    "type": "string"
+                },
+                "stream": {
+                    "description": "optional override stream name",
+                    "type": "string"
+                },
+                "subject": {
+                    "description": "optional override",
+                    "type": "string"
+                },
+                "timestamp": {
+                    "description": "ISO string, defaults now",
+                    "type": "string"
+                },
+                "token": {
+                    "description": "JWT for WS connect",
+                    "type": "string"
+                },
+                "type": {
+                    "description": "stream key, e.g. CHAT/NOTIFY",
+                    "type": "string"
+                },
+                "user_id": {
+                    "description": "optional routing",
+                    "type": "string"
+                }
+            }
+        }
+    }
 }

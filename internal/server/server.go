@@ -19,9 +19,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	_ "github.com/attchat/attchat-gateway-api/docs"
+	docs "github.com/attchat/attchat-gateway-api/docs"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
+	fiberswagger "github.com/gofiber/swagger"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -47,7 +50,6 @@ var (
 var (
 	jsClient     jetstream.JetStream
 	jsStreams    []string
-	natsConn     *nats.Conn
 	streamsMu    sync.Mutex
 	jsReadyError error
 	wsBaseURL    string
@@ -67,12 +69,12 @@ type publishRequest struct {
 	UserID    string          `json:"user_id,omitempty"` // optional routing
 	BrandID   string          `json:"brand_id,omitempty"`
 	ChatID    string          `json:"chat_id,omitempty"`
-	Message   string          `json:"message,omitempty"`   // optional message content
-	Payload   json.RawMessage `json:"payload,omitempty"`   // full payload if caller already structured
-	Timestamp string          `json:"timestamp,omitempty"` // ISO string, defaults now
-	Subject   string          `json:"subject,omitempty"`   // optional override
-	Stream    string          `json:"stream,omitempty"`    // optional override stream name
-	Token     string          `json:"token,omitempty"`     // JWT for WS connect
+	Message   string          `json:"message,omitempty"`                      // optional message content
+	Payload   json.RawMessage `json:"payload,omitempty" swaggertype:"object"` // full payload if caller already structured
+	Timestamp string          `json:"timestamp,omitempty"`                    // ISO string, defaults now
+	Subject   string          `json:"subject,omitempty"`                      // optional override
+	Stream    string          `json:"stream,omitempty"`                       // optional override stream name
+	Token     string          `json:"token,omitempty"`                        // JWT for WS connect
 }
 
 type natsEvent struct {
@@ -104,6 +106,9 @@ func Start() {
 	chatBase := getenvDefault("CHAT_SERVICE_BASE", "http://localhost:8080/api/v1")
 	chatBase = strings.TrimRight(chatBase, "/")
 	wsBaseURL = getenvDefault("GATEWAY_WS_BASE", "ws://localhost:8086/ws")
+	docs.SwaggerInfo.Title = "ATTChat Gateway API"
+	docs.SwaggerInfo.Version = "2.0"
+	docs.SwaggerInfo.BasePath = "/"
 	allowedIssuers := loadAllowedIssuers()
 	pubKeyPEM := loadPublicKey()
 	if strings.TrimSpace(pubKeyPEM) == "" {
@@ -183,17 +188,11 @@ func Start() {
 		})
 	})
 
+	// Swagger UI
+	app.Get("/swagger/*", fiberswagger.HandlerDefault)
+
 	// Health check
-	app.Get("/health", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"status": "ok",
-			"jetstream": fiber.Map{
-				"streams":   jsStreams,
-				"connected": jsReadyError == nil,
-				"error":     errorString(jsReadyError),
-			},
-		})
-	})
+	app.Get("/health", healthHandler)
 
 	// Proxy /api/* xuống chat-service
 	app.All("/api/*", forwardToChat(chatBase))
@@ -320,6 +319,16 @@ func forwardToChat(chatBase string) fiber.Handler {
 }
 
 // handlePublishEvent publishes chat metadata into JetStream
+// @Summary Publish chat event to JetStream
+// @Tags chat
+// @Accept json
+// @Produce json
+// @Param payload body publishRequest true "Event payload"
+// @Success 200 {object} map[string]interface{}
+// @Failure 400 {object} map[string]interface{}
+// @Failure 401 {object} map[string]interface{}
+// @Failure 503 {object} map[string]interface{}
+// @Router /api/publish-chat-event [post]
 func handlePublishEvent(c *fiber.Ctx) error {
 	if jsClient == nil || jsReadyError != nil {
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "jetstream_unavailable", "detail": errorString(jsReadyError)})
@@ -337,7 +346,7 @@ func handlePublishEvent(c *fiber.Ctx) error {
 	if streamName == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing_type", "detail": "type/stream is required to pick JetStream stream"})
 	}
-	streamName = strings.ToUpper(streamName)
+	streamName = strings.ToLower(streamName)
 
 	// Pick token for WS connect: prefer body, fallback Authorization header
 	token := strings.TrimSpace(req.Token)
@@ -453,7 +462,6 @@ func initJetStream() error {
 	if err != nil {
 		return err
 	}
-	natsConn = nc
 
 	js, err := jetstream.New(nc)
 	if err != nil {
@@ -478,13 +486,20 @@ func ensureStream(streamName string) error {
 	streamsMu.Lock()
 	defer streamsMu.Unlock()
 
-	if info, _ := jsClient.Stream(context.Background(), streamName); info != nil {
-		return nil
+	ctx := context.Background()
+	nameCandidates := []string{streamName, strings.ToUpper(streamName), strings.ToLower(streamName)}
+	for _, n := range nameCandidates {
+		if info, _ := jsClient.Stream(ctx, n); info != nil {
+			return nil
+		}
 	}
 
-	_, err := jsClient.CreateStream(context.Background(), jetstream.StreamConfig{
-		Name:      streamName,
-		Subjects:  []string{streamName + ".>"},
+	createName := strings.ToUpper(streamName)
+	createSubject := strings.ToLower(streamName) + ".>"
+
+	_, err := jsClient.CreateStream(ctx, jetstream.StreamConfig{
+		Name:      createName,
+		Subjects:  []string{createSubject},
 		Storage:   jetstream.FileStorage,
 		Retention: jetstream.LimitsPolicy,
 	})
@@ -522,6 +537,23 @@ func buildWSURL(base string, params map[string]string) (string, error) {
 	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil
+}
+
+// healthHandler returns health status
+// @Summary Health check
+// @Tags health
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Router /health [get]
+func healthHandler(c *fiber.Ctx) error {
+	return c.JSON(fiber.Map{
+		"status": "ok",
+		"jetstream": fiber.Map{
+			"streams":   jsStreams,
+			"connected": jsReadyError == nil,
+			"error":     errorString(jsReadyError),
+		},
+	})
 }
 
 // measureNetworkMbps performs a small download against a configurable URL to estimate throughput.
