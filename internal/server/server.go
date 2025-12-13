@@ -354,9 +354,6 @@ func handlePublishEvent(c *fiber.Ctx) error {
 		authz := c.Get("Authorization")
 		token = strings.TrimSpace(strings.TrimPrefix(authz, "Bearer "))
 	}
-	if token == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing_token", "detail": "token is required for WS connect"})
-	}
 
 	eventName := strings.TrimSpace(req.Event)
 	if eventName == "" {
